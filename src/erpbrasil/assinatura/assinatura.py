@@ -1,5 +1,10 @@
 # coding=utf-8
+import sys
+import xmlsec
+from xmlsec import constants as consts
 import signxml
+from OpenSSL import crypto
+from base64 import b64encode
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding
 from endesive import pdf
@@ -12,6 +17,9 @@ class Assinatura(object):
 
     def __init__(self, certificado):
         self.certificado = certificado
+        self.cert = certificado._cert
+        self.chave_privada = certificado._chave
+        self.senha = certificado._senha
 
     def assina_xml2(self, xml_element, reference, getchildren=False):
         for element in xml_element.iter("*"):
@@ -60,6 +68,56 @@ class Assinatura(object):
                 parent = element_signed.getparent()
                 parent.append(signature)
         return etree.tostring(signed_root, encoding=str)
+
+    def _checar_certificado(self):
+        if not self.chave_privada:
+            raise Exception("Certificado não existe.")
+
+    def assina_nfse(self, template):
+        self._checar_certificado()
+
+        key = xmlsec.Key.from_memory(
+            self.chave_privada,
+            format=xmlsec.constants.KeyDataFormatPem,
+            password=self.senha,
+        )
+
+        signature_node = xmlsec.template.create(
+            template,
+            c14n_method=consts.TransformInclC14N,
+            sign_method=consts.TransformRsaSha1,
+        )
+        template.append(signature_node)
+        ref = xmlsec.template.add_reference(
+            signature_node, consts.TransformSha1, uri=""
+        )
+
+        xmlsec.template.add_transform(ref, consts.TransformEnveloped)
+        xmlsec.template.add_transform(ref, consts.TransformInclC14N)
+
+        ki = xmlsec.template.ensure_key_info(signature_node)
+        xmlsec.template.add_x509_data(ki)
+
+        ctx = xmlsec.SignatureContext()
+        ctx.key = key
+
+        ctx.key.load_cert_from_memory(self.cert,
+                                      consts.KeyDataFormatPem)
+
+        ctx.sign(signature_node)
+        return etree.tostring(template, encoding=str)
+
+    def assina_string(self, message):
+        private_key = self.certificado.key
+        signature = private_key.sign(
+            message,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA1()),
+                salt_length=padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA1()
+        )
+        return signature
 
     def assina_pdf(self, arquivo, dados_assinatura, altoritimo='sha256'):
         return pdf.cms.sign(
@@ -112,6 +170,11 @@ class Assinatura(object):
             hashes.SHA1()
         )
         return signature
+
+    def assina_tag(self, message):
+        chave_privada = self.certificado._pkcs12.get_privatekey()
+        assianado = crypto.sign(chave_privada, message, "SHA1")
+        return b64encode(assianado).decode()
 
     def verificar_assinatura_string(self, message, signature):
         public_key = self.certificado.key.public_key()
